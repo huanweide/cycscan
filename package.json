@@ -1,0 +1,25 @@
+{
+  "name": "cycscan",
+  "version": "1.0.0",
+  "description": "零依赖单文件 Node CLI · 结构复杂度（圈复杂度 + 函数长度）静态扫描器，开箱进 CI",
+  "bin": {
+    "cycscan": "index.js"
+  },
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "keywords": [
+    "complexity",
+    "cyclomatic-complexity",
+    "static-analysis",
+    "code-health",
+    "lint",
+    "ci",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=14"
+  }
+}
