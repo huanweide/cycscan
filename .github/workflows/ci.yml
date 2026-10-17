@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['14', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # engines 声称 >=14，而 node --test 需要 18+。
+      # Node 14 走直接 node 脚本分支（单测与冒烟都是零依赖自研 runner，不依赖 node --test）。
+      # CI 必须真跑 engines 声称的最低版本，否则就是谎报支持。
+      - name: Node 14 —— 单测 + 冒烟
+        if: matrix.node == '14'
+        shell: bash
+        run: |
+          set -e
+          echo "node: $(node -v)"
+          node index.js --version
+          node test/unit.test.js
+          node test/smoke-cli.js
+
+      - name: Node 22 —— 单测 + 冒烟
+        if: matrix.node != '14'
+        run: |
+          node -v
+          npm test
+
+      - name: 语法自检
+        run: node --check index.js
+
+  dogfood:
+    name: dogfood（用本仓自身跑门禁）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # 必须显式配阈值：cycscan 无阈值时返回 3（未决），这是刻意设计。
+      - name: 自家门禁（显式阈值 + 严格结构约束）
+        run: |
+          node index.js --root . --max-issues 0 --max-complexity 10 --max-lines 60 --fail-on-high
+      - name: JSON 输出可解析 + basisComplete 为真 + 自身问题归零
+        run: |
+          node index.js --root . --json --max-issues 0 > cy.json
+          node -e "
+            const j = require('./cy.json');
+            if (j.basisComplete !== true) { console.error('basisComplete 不是 true，扫描输入不可信'); process.exit(1); }
+            if (j.gate.state !== 'pass') { console.error('门禁未通过: ' + j.gate.state + ' ' + j.gate.reason); process.exit(1); }
+            if (j.files < 1) { console.error('扫到 0 个文件，dogfood 无意义'); process.exit(1); }
+            if (j.issueCount !== 0) {
+              console.error('自身检出 ' + j.issueCount + ' 个问题，本工具 dogfood 必须归零');
+              process.exit(1);
+            }
+            console.log('dogfood ok: files=' + j.files + ' fns=' + j.functionCount +
+                        ' maxCplx=' + j.maxComplexity + ' maxLines=' + j.maxLines);
+          "

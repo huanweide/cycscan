@@ -14,7 +14,13 @@
  *     if/for/switch 误算成真实分支（已修复 awaitscan 跨行块注释塌缩 bug）。
  *   - 函数边界：括号平衡定位函数体；圈复杂度计数「排除嵌套函数内层块」，
  *     只算函数自身表层分支（嵌套函数复杂度归它自己），避免爷爷函数被孙子分支虚高。
- *   - 门禁阈值一律 Number.isFinite 校验，非整数直接 exit 2，绝不静默放行。
+ *   - 门禁阈值与检测阈值一律严格校验：非数字 / 非整数 / 负数 / 空串 / 缺值 一律 exit 2，
+ *     绝不静默放行。检测阈值（--complexity-threshold 等）尤其关键：NaN 会让
+ *     `cplx > NaN` 恒为 false，导致整个检测静默失效、rc 仍为 0（最恶劣的失效形态）。
+ *   - 门禁三态：pass(0) / fail(2) / inconclusive(3)。
+ *     未配阈值、或扫描输入为空 → inconclusive(3)，绝不谎报「通过」。
+ *   - 输入为空时不输出健康分（健康分是有害指标：扫 0 个文件报 100 分会让用户停止思考）。
+ *   - 门禁失败消息必须回显真实阈值，不得打印 undefined。
  *   - root 必须 statSync 先验存在且为目录，错误路径不谎报「通过」。
  *   - 大文件（>5MB）跳过，避免 OOM。
  *   - 工具自身所有函数复杂度 < 10、长度 < 60 行（dogfood 必须归零）。
@@ -26,6 +32,17 @@ const path = require('path');
 const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5MB 上限，跳过防 OOM
 const SCORE_FREE = 1;                   // 每千行允许加权问题数（不扣分）
 const SCORE_K = 25;                     // 超出部分扣分系数
+
+// 门禁三态
+const GATE_STATE = { PASS: 'pass', FAIL: 'fail', INCONCLUSIVE: 'inconclusive' };
+const EXIT_FOR_STATE = { pass: 0, fail: 2, inconclusive: 3 };
+
+// 哨兵异常：帮助 / 用法错误。把「参数错误」与「运行异常」分成两条干净的退出路径，
+// 避免 try/catch 只包了一半函数体导致 UsageExit 逃逸成满屏 stack trace + rc=1。
+class HelpExit extends Error {}
+class UsageExit extends Error {
+  constructor(message, code) { super(message); this.code = code === undefined ? 2 : code; }
+}
 
 // 规则定义（严重度 / 权重）
 const RULES = {
@@ -389,52 +406,63 @@ function topN(map, n) {
     .map(([p, c]) => ({ path: p, count: c }));
 }
 
-function analyze(root, thresholds) {
-  const files = scanRoot(root);
-  const issues = [];
-  const byRule = {};
-  const bySeverity = { high: 0, medium: 0, low: 0 };
-  const byFile = {};
-  let totalWeighted = 0;
-  let srcLines = 0;
-  let maxComplexity = 0;
-  let maxLines = 0;
-  let functionCount = 0;
-  for (const r of Object.values(RULES)) byRule[r.id] = 0;
-
-  for (let i = 0; i < files.length; i++) {
-    const res = scanFile(files[i], thresholds);
-    if (!res) continue;
-    srcLines += res.lineCount;
-    functionCount += res.functionCount;
-    if (res.maxComplexity > maxComplexity) maxComplexity = res.maxComplexity;
-    if (res.maxLines > maxLines) maxLines = res.maxLines;
-    if (res.issues.length) {
-      byFile[files[i]] = (byFile[files[i]] || 0) + res.issues.length;
-      res.issues.forEach(it => {
-        byRule[it.rule.id]++;
-        bySeverity[it.rule.severity]++;
-        totalWeighted += it.rule.weight;
-        issues.push(it);
-      });
-    }
+// 把单文件结果累加进累加器（拆函数以压低 analyze 自身复杂度 —— 本工具 dogfood 必须归零）
+function accumulate(acc, file, res) {
+  acc.srcLines += res.lineCount;
+  acc.functionCount += res.functionCount;
+  if (res.maxComplexity > acc.maxComplexity) acc.maxComplexity = res.maxComplexity;
+  if (res.maxLines > acc.maxLines) acc.maxLines = res.maxLines;
+  if (!res.issues.length) return;
+  acc.byFile[file] = (acc.byFile[file] || 0) + res.issues.length;
+  for (const it of res.issues) {
+    acc.byRule[it.rule.id]++;
+    acc.bySeverity[it.rule.severity]++;
+    acc.totalWeighted += it.rule.weight;
+    acc.issues.push(it);
   }
+}
 
-  const weightedDensity = srcLines > 0 ? totalWeighted / (srcLines / 1000) : 0;
-  const score = computeScore(weightedDensity);
+function newAccumulator() {
+  const byRule = {};
+  for (const r of Object.values(RULES)) byRule[r.id] = 0;
+  return {
+    issues: [], byRule, byFile: {},
+    bySeverity: { high: 0, medium: 0, low: 0 },
+    totalWeighted: 0, srcLines: 0, maxComplexity: 0, maxLines: 0, functionCount: 0
+  };
+}
+
+function sortIssues(issues) {
+  const sev = { high: 0, medium: 1, low: 2 };
   issues.sort((a, b) => {
-    const sev = { high: 0, medium: 1, low: 2 };
     if (sev[a.rule.severity] !== sev[b.rule.severity]) return sev[a.rule.severity] - sev[b.rule.severity];
     if (a.file !== b.file) return a.file < b.file ? -1 : 1;
     return a.line - b.line;
   });
+}
+
+function analyze(root, thresholds) {
+  const files = scanRoot(root);
+  const acc = newAccumulator();
+  for (let i = 0; i < files.length; i++) {
+    const res = scanFile(files[i], thresholds);
+    if (res) accumulate(acc, files[i], res);
+  }
+
+  const weightedDensity = acc.srcLines > 0 ? acc.totalWeighted / (acc.srcLines / 1000) : 0;
+  // 健康分是有害指标：扫描输入为空时没有健康可言，返回 null 而不是 100。
+  const basisComplete = files.length > 0 && acc.srcLines > 0;
+  const score = basisComplete ? computeScore(weightedDensity) : { score: null, verdict: '无法评估' };
+  sortIssues(acc.issues);
 
   return {
-    root, files: files.length, functionCount, srcLines, issueCount: issues.length,
-    totalWeighted, byRule, bySeverity, weightedDensity: Number(weightedDensity.toFixed(2)),
-    maxComplexity, maxLines,
+    root, files: files.length, functionCount: acc.functionCount, srcLines: acc.srcLines,
+    issueCount: acc.issues.length, totalWeighted: acc.totalWeighted,
+    byRule: acc.byRule, bySeverity: acc.bySeverity,
+    weightedDensity: Number(weightedDensity.toFixed(2)),
+    maxComplexity: acc.maxComplexity, maxLines: acc.maxLines, basisComplete,
     healthScore: score.score, verdict: score.verdict,
-    topFiles: topN(byFile, 10), issues
+    topFiles: topN(acc.byFile, 10), issues: acc.issues
   };
 }
 
@@ -467,29 +495,76 @@ function buildWarnings(a) {
 }
 
 // 门禁检查表（避免重复分支把 applyGate 自身复杂度拉爆）
+// 消息函数的签名是 (a, threshold) —— 阈值必须由调用方从 args 传入。
+// 旧实现写成 a => ... + a.maxHigh，而阈值实际存在 args 上、不在 a 上，
+// 导致所有失败消息回显 `undefined`；--max-complexity/--max-lines 更荒唐：
+// 两边打印同一个实测值（`16 > --max-complexity 16`），等于什么都没说。
 const GATE_CHECKS = [
   ['maxHigh', '--max-high', a => a.bySeverity.high,
-    a => '高危问题 ' + a.bySeverity.high + ' > --max-high ' + a.maxHigh],
+    (a, t) => '高危问题 ' + a.bySeverity.high + ' > --max-high ' + t],
   ['maxMedium', '--max-medium', a => a.bySeverity.medium,
-    a => '中危问题 ' + a.bySeverity.medium + ' > --max-medium ' + a.maxMedium],
+    (a, t) => '中危问题 ' + a.bySeverity.medium + ' > --max-medium ' + t],
   ['maxIssues', '--max-issues', a => a.issueCount,
-    a => '总问题数 ' + a.issueCount + ' > --max-issues ' + a.maxIssues],
+    (a, t) => '总问题数 ' + a.issueCount + ' > --max-issues ' + t],
   ['maxComplexity', '--max-complexity', a => a.maxComplexity,
-    a => '最高圈复杂度 ' + a.maxComplexity + ' > --max-complexity ' + a.maxComplexity],
+    (a, t) => '最高圈复杂度 ' + a.maxComplexity + ' > --max-complexity ' + t],
   ['maxLines', '--max-lines', a => a.maxLines,
-    a => '最长函数 ' + a.maxLines + ' 行 > --max-lines ' + a.maxLines]
+    (a, t) => '最长函数 ' + a.maxLines + ' 行 > --max-lines ' + t]
 ];
 
-function applyGate(a, args, warnings) {
+/**
+ * 门禁三态判定。
+ * 判定顺序：① 是否配了阈值 → ② 输入是否可信 → ③ 是否有不达标项。
+ * 顺序不能颠倒：输入为空时先报「通过」是本家族最恶劣的失败模式（假绿灯）。
+ */
+// 门禁开关清单：用数组.some 而非一串 ||，避免把 buildGateState 自身复杂度顶爆
+const GATE_OPTS = ['maxHigh', 'maxMedium', 'maxIssues', 'maxComplexity', 'maxLines'];
+
+function isGateConfigured(opts) {
+  return GATE_OPTS.some(k => opts[k] !== undefined) ||
+    !!opts.failOnHigh || !!opts.failOnIssues;
+}
+
+function buildGateState({ files, srcLines, basisComplete, opts, gate }) {
+  const configured = isGateConfigured(opts);
+  if (!configured) {
+    return {
+      state: GATE_STATE.INCONCLUSIVE, configured: false,
+      reason: '未配置任何门禁阈值；本次输出一律不构成「门禁通过」结论。' +
+              '请显式传入 --max-high / --max-medium / --max-issues / --max-complexity / --max-lines / --fail-on-high / --fail-on-issues 之一。'
+    };
+  }
+  if (files === 0) {
+    return {
+      state: GATE_STATE.INCONCLUSIVE, configured: true,
+      reason: '扫描输入为空：0 个源文件，门禁结论不可信（而非「通过」）。' +
+              '请确认 --root 指向真实源码目录，且目录下有 .js/.ts/.jsx/.tsx/.vue/.svelte 文件。'
+    };
+  }
+  if (!basisComplete || srcLines === 0) {
+    return {
+      state: GATE_STATE.INCONCLUSIVE, configured: true,
+      reason: '扫描到的文件全部无可解析内容（总行数 0），门禁结论不可信。'
+    };
+  }
+  if (gate && gate.length) {
+    return { state: GATE_STATE.FAIL, configured: true, reason: '存在 ' + gate.length + ' 项不达标。' };
+  }
+  return { state: GATE_STATE.PASS, configured: true, reason: '全部已配置门禁项达标。' };
+}
+
+function exitCodeFor(state) {
+  return EXIT_FOR_STATE[state] === undefined ? 3 : EXIT_FOR_STATE[state];
+}
+
+/** 计算门禁不达标项列表（不含三态判定）。阈值合法性已在 parseArgs 阶段拦掉。 */
+function collectGateFailures(a, args, warnings) {
   const gate = [];
   for (let i = 0; i < GATE_CHECKS.length; i++) {
     const key = GATE_CHECKS[i][0];
     if (args[key] === undefined) continue;
-    if (!Number.isFinite(args[key])) {
-      console.error('[cycscan] 错误：' + GATE_CHECKS[i][1] + ' 必须为整数');
-      return { code: 2, gate: null };
-    }
-    if (GATE_CHECKS[i][2](a) > args[key]) gate.push(GATE_CHECKS[i][3](a));
+    const threshold = args[key];
+    if (GATE_CHECKS[i][2](a) > threshold) gate.push(GATE_CHECKS[i][3](a, threshold));
   }
   if (args.failOnHigh && a.bySeverity.high > 0) {
     gate.push('存在 ' + a.bySeverity.high + ' 处高危问题');
@@ -497,7 +572,18 @@ function applyGate(a, args, warnings) {
   if (args.failOnIssues && warnings.length > 0) {
     gate.push('存在 ' + warnings.length + ' 条警告');
   }
-  return { code: gate.length ? 2 : 0, gate };
+  return gate;
+}
+
+/** 兼容旧调用：返回 { code, gate, state }，code 由三态推导。 */
+function applyGate(a, args, warnings) {
+  const gate = collectGateFailures(a, args, warnings || []);
+  const state = buildGateState({
+    files: a.files, srcLines: a.srcLines,
+    basisComplete: a.basisComplete !== undefined ? a.basisComplete : (a.files > 0 && a.srcLines > 0),
+    opts: args, gate
+  });
+  return { code: exitCodeFor(state.state), gate, state };
 }
 
 // ---------------------------------------------------------------------------
@@ -514,13 +600,41 @@ const NUM_FLAGS = {
   '--max-lines': 'maxLines'
 };
 
-const STR_FLAGS = {
-  '--root': 'root'
-};
-
 const BOOL_FLAGS = {
   '--json': 1, '--version': 1, '-V': 1, '--help': 1, '-h': 1,
   '--fail-on-high': 1, '--fail-on-issues': 1
+};
+
+function usageError(msg) {
+  throw new UsageExit('[cycscan] 错误：' + msg, 2);
+}
+
+/**
+ * 严格数值参数校验。
+ * 陷阱：Number('') === 0、parseInt('5abc') === 5、parseInt('abc') === NaN。
+ * 最后一条对本工具尤其致命：--complexity-threshold abc 会让阈值变成 NaN，
+ * 而 `cplx > NaN` 恒为 false —— 整个检测静默失效，一个问题都报不出来，rc 仍为 0。
+ */
+function parseNumberFlag(flag, raw, { min }) {
+  if (raw === undefined) usageError(flag + ' 缺少数值参数');
+  if (typeof raw !== 'string' || raw.trim() === '') usageError(flag + ' 需要数值参数（收到空值）');
+  if (raw.trim().startsWith('-')) usageError(flag + ' 需要非负数（收到: ' + raw + '）');
+  // 尾随垃圾检测：'5abc' / '1.2.3' / '0x10'
+  if (!/^\d+$/.test(raw.trim())) {
+    usageError(flag + ' 需要十进制非负整数（收到: ' + raw + '）');
+  }
+  const v = Number(raw);
+  if (!Number.isFinite(v)) usageError(flag + ' 需要有限数字（收到: ' + raw + '）');
+  if (!Number.isInteger(v)) usageError(flag + ' 需要整数（收到: ' + raw + '）');
+  if (v < min) usageError(flag + ' 需要 >= ' + min + ' 的整数（收到: ' + raw + '）');
+  return v;
+}
+
+// 检测阈值与门禁阈值的最小合法值不同：
+// 检测阈值 0 是合法的（极端严格，报告一切）；门禁阈值 0 也是合法的（禁止任何一项）。
+const MIN_BY_FLAG = {
+  '--complexity-threshold': 1,
+  '--lines-threshold': 1
 };
 
 function setBool(args, a) {
@@ -531,22 +645,53 @@ function setBool(args, a) {
   else if (a === '--fail-on-issues') args.failOnIssues = true;
 }
 
+// 解析 --root（拆函数以压低 parseArgs 自身复杂度 —— 本工具 dogfood 必须归零）
+function parseRootFlag(raw) {
+  if (raw === undefined) usageError('--root 缺少目录参数');
+  if (typeof raw !== 'string' || raw.trim() === '') usageError('--root 需要非空目录路径');
+  if (raw.startsWith('-')) usageError('--root 缺少目录参数（收到标志: ' + raw + '）');
+  return raw;
+}
+
+// 兜底也必须报错：拼错的门禁参数 = 门禁不存在，绝不静默吞掉
+function rejectUnknown(a) {
+  if (a.startsWith('-')) {
+    usageError('未知选项: ' + a + '（用 --help 查看可用选项；门禁参数写错 = 门禁不存在）');
+  }
+  usageError('未知参数: ' + a + '（位置参数只接受 scan）');
+}
+
 function parseArgs(argv) {
   const args = { _: [], root: process.cwd(), json: false,
     complexityThreshold: 10, linesThreshold: 60 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a in NUM_FLAGS) { args[NUM_FLAGS[a]] = parseInt(argv[++i], 10); continue; }
-    if (a in STR_FLAGS) { args[STR_FLAGS[a]] = argv[++i]; continue; }
-    if (a === 'scan') { args._.push(a); continue; }
-    if (a in BOOL_FLAGS) { setBool(args, a); continue; }
+    if (a in NUM_FLAGS) {
+      const min = MIN_BY_FLAG[a] === undefined ? 0 : MIN_BY_FLAG[a];
+      args[NUM_FLAGS[a]] = parseNumberFlag(a, argv[++i], { min });
+    } else if (a === '--root') {
+      args.root = parseRootFlag(argv[++i]);
+    } else if (a === 'scan') {
+      args._.push(a);
+    } else if (a in BOOL_FLAGS) {
+      setBool(args, a);
+    } else {
+      rejectUnknown(a);
+    }
   }
   return args;
+}
+
+function packageVersion() {
+  const pkg = readJsonSafe(path.join(__dirname, 'package.json'));
+  return pkg && pkg.version ? pkg.version : '0.0.0';
 }
 
 function printHelp() {
   console.log([
     'cycscan — 零依赖单文件结构复杂度静态扫描 CLI',
+    '',
+    '版本: ' + packageVersion(),
     '',
     '用法:',
     '  cycscan [scan] [--root <dir>] [--json]',
@@ -559,11 +704,11 @@ function printHelp() {
     '         C1 complex-function  圈复杂度过高（默认 >10）',
     '         C2 long-function     函数过长（默认 >60 行）',
     '',
-    '检测阈值（调松/调严扫描灵敏度）：',
+    '检测阈值（调松/调严扫描灵敏度；[>= 1 的整数]）:',
     '  --complexity-threshold <n>  圈复杂度报警阈值（默认 10）',
     '  --lines-threshold <n>       函数长度报警阈值（默认 60 行）',
     '',
-    '门禁（非整数阈值直接 exit 2）：',
+    '门禁（阈值非法一律 exit 2，绝不静默放行；[>= 0 的整数]）:',
     '  --max-high <n>     高危问题(圈复杂度过高) 超过则失败',
     '  --max-medium <n>   中危问题(函数过长) 超过则失败',
     '  --max-issues <n>   总问题数超过则失败',
@@ -572,11 +717,17 @@ function printHelp() {
     '  --fail-on-high     出现任何圈复杂度过高即失败',
     '  --fail-on-issues   存在任何警告即失败',
     '',
-    '其他：',
+    '退出码契约:',
+    '  0  pass          已配置门禁且全部达标',
+    '  2  fail          已配置门禁且存在不达标项 / 参数非法',
+    '  3  inconclusive  未配置门禁阈值，或扫描输入为空 —— 结论不可信，**不等于通过**',
+    '',
+    '其他:',
     '  --version, -V       打印版本号',
     '  --help, -h          打印本帮助',
     '',
-    '健康分：每千行允许加权问题 ' + SCORE_FREE + ' 不扣分，超出按系数 ' + SCORE_K + ' 扣，0-100。'
+    '健康分：每千行允许加权问题 ' + SCORE_FREE + ' 不扣分，超出按系数 ' + SCORE_K + ' 扣，0-100。',
+    '      扫描输入为空时健康分为 null（无法评估），不会给出 100 分误导你。'
   ].join('\n'));
 }
 
@@ -597,13 +748,15 @@ function printTopFiles(topFiles) {
   }
 }
 
-function printGate(gate) {
-  if (!gate) return;
-  if (gate.length) {
-    console.log('  门禁: 失败');
+function printGate(gate, gateState) {
+  // 门禁状态始终显式打印，包括 pass —— 沉默的绿灯是假绿灯的温床。
+  const label = gateState.state === GATE_STATE.PASS ? '通过'
+    : gateState.state === GATE_STATE.FAIL ? '失败'
+    : '未决（结论不可信，不等于通过）';
+  console.log('  门禁: ' + label + '  [state=' + gateState.state + ' configured=' + gateState.configured + ']');
+  console.log('    理由: ' + gateState.reason);
+  if (gate && gate.length) {
     for (let i = 0; i < gate.length; i++) console.log('    [失败] ' + gate[i]);
-  } else {
-    console.log('  门禁: 通过');
   }
 }
 
@@ -616,7 +769,7 @@ function printWarnings(warnings) {
   }
 }
 
-function printReport(a, warnings, gate) {
+function printHeadline(a) {
   console.log('cycscan · 结构复杂度扫描 · root=' + a.root);
   console.log('  扫描源文件   : ' + a.files);
   console.log('  函数总数     : ' + a.functionCount);
@@ -624,31 +777,43 @@ function printReport(a, warnings, gate) {
   console.log('  问题总数     : ' + a.issueCount + ' (加权 ' + a.totalWeighted + ')');
   console.log('  最高圈复杂度 : ' + a.maxComplexity);
   console.log('  最长函数     : ' + a.maxLines + ' 行');
-  console.log('  严重度分布   : high=' + a.bySeverity.high + ' medium=' + a.bySeverity.medium + ' low=' + a.bySeverity.low);
+  console.log('  严重度分布   : high=' + a.bySeverity.high +
+    ' medium=' + a.bySeverity.medium + ' low=' + a.bySeverity.low);
   const ruleLine = Object.keys(a.byRule).filter(k => a.byRule[k] > 0)
     .map(k => k + '=' + a.byRule[k]).join('  ');
   if (ruleLine) console.log('  规则明细     : ' + ruleLine);
   if (a.issues.length) printIssues(a.issues, a.root);
   if (a.topFiles.length) printTopFiles(a.topFiles);
-  console.log('  健康分       : ' + a.healthScore + ' / 100  [' + a.verdict + ']');
+}
+
+function printScore(a) {
+  // 扫描输入为空时健康分为 null（无法评估），不给出 100 分误导用户
+  if (a.basisComplete) {
+    console.log('  健康分       : ' + a.healthScore + ' / 100  [' + a.verdict + ']');
+  } else {
+    console.log('  健康分       : 无法评估（扫描输入为空，扫描 0 个源文件）');
+  }
   if (a.elapsed !== undefined) console.log('  耗时         : ' + a.elapsed + ' ms');
+}
+
+function printReport(a, warnings, gate, gateState) {
+  printHeadline(a);
+  printScore(a);
   printWarnings(warnings);
-  printGate(gate);
+  printGate(gate, gateState);
 }
 
 function main(argv) {
   const args = parseArgs(argv);
   if (args.help) { printHelp(); return 0; }
   if (args.version) {
-    const pkg = readJsonSafe(path.join(__dirname, 'package.json'));
-    console.log('cycscan ' + (pkg && pkg.version ? pkg.version : '1.0.0'));
+    console.log('cycscan ' + packageVersion());
     return 0;
   }
 
   const root = path.resolve(args.root);
   if (!isDir(root)) {
-    console.error('[cycscan] 错误：root 不是有效目录 -> ' + root);
-    return 2;
+    usageError('root 不是有效目录 -> ' + root);
   }
 
   const thresholds = { complexity: args.complexityThreshold, lines: args.linesThreshold };
@@ -656,8 +821,12 @@ function main(argv) {
   const a = analyze(root, thresholds);
   a.elapsed = Date.now() - t0;
   const warnings = buildWarnings(a);
-  const gateRes = applyGate(a, args, warnings);
-  if (gateRes.gate === null) return gateRes.code; // 阈值非法已报错
+  const gate = collectGateFailures(a, args, warnings);
+  const gateState = buildGateState({
+    files: a.files, srcLines: a.srcLines, basisComplete: a.basisComplete,
+    opts: args, gate
+  });
+  const code = exitCodeFor(gateState.state);
 
   if (args.json) {
     const report = {
@@ -665,35 +834,55 @@ function main(argv) {
       issueCount: a.issueCount, totalWeighted: a.totalWeighted,
       byRule: a.byRule, bySeverity: a.bySeverity, weightedDensity: a.weightedDensity,
       maxComplexity: a.maxComplexity, maxLines: a.maxLines,
+      basisComplete: a.basisComplete,
       healthScore: a.healthScore, verdict: a.verdict,
       topFiles: a.topFiles, issues: a.issues, elapsed: a.elapsed, warnings,
-      gate: { passed: gateRes.gate.length === 0, failures: gateRes.gate }
+      gate: {
+        state: gateState.state,
+        configured: gateState.configured,
+        reason: gateState.reason,
+        failures: gate
+      }
     };
     console.log(JSON.stringify(report, null, 2));
   } else {
-    printReport(a, warnings, gateRes.gate);
+    printReport(a, warnings, gate, gateState);
   }
-  return gateRes.code;
+  return code;
+}
+
+function run(argv) {
+  try {
+    return main(argv);
+  } catch (e) {
+    if (e instanceof HelpExit) return 0;
+    if (e instanceof UsageExit) {
+      console.error(e.message);
+      process.exitCode = e.code;
+      return e.code;
+    }
+    console.error('[cycscan] 运行异常: ' + (e && e.message));
+    process.exitCode = 1;
+    return 1;
+  }
 }
 
 module.exports = {
   RULES, SRC_EXT, SKIP_DIRS, MAX_FILE_BYTES, SCORE_FREE, SCORE_K,
-  NUM_FLAGS, STR_FLAGS, BOOL_FLAGS, GATE_CHECKS,
-  readJsonSafe, isDir, isFile, fileSize, countLines,
+  NUM_FLAGS, BOOL_FLAGS, GATE_CHECKS, MIN_BY_FLAG,
+  GATE_STATE, EXIT_FOR_STATE, HelpExit, UsageExit,
+  readJsonSafe, isDir, isFile, fileSize, countLines, packageVersion,
   skipLineComment, skipBlockComment, skipString, fillSpaces, stripNoise,
   matchBracket, braceBlocks, lineOf, skipWs, exprEnd,
   CTRL_KEYWORDS, findParamOpen, findFunctionKeyword, findArrows, findMethods,
   findFunctions, isInsideNestedFn, countComplexity, detectInText,
-  scanFile, scanRoot, analyze, computeScore,
-  buildWarnings, applyGate, parseArgs, setBool,
-  printIssues, printTopFiles, printGate, printWarnings, printReport, main
+  scanFile, scanRoot, accumulate, newAccumulator, sortIssues, analyze, computeScore,
+  buildWarnings, GATE_OPTS, isGateConfigured, buildGateState, exitCodeFor, collectGateFailures, applyGate,
+  parseArgs, setBool, parseNumberFlag,
+  printIssues, printTopFiles, printGate, printWarnings, printHeadline, printScore, printReport, main, run
 };
 
 if (require.main === module) {
-  try {
-    process.exit(main(process.argv.slice(2)));
-  } catch (e) {
-    console.error('[cycscan] 运行异常: ' + (e && e.message));
-    process.exit(1);
-  }
+  // 用 exitCode 而非 process.exit()：后者会截断异步刷写的 stdout，导致 --json 输出残缺。
+  process.exitCode = run(process.argv.slice(2));
 }

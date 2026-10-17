@@ -1,13 +1,21 @@
 {
   "name": "cycscan",
-  "version": "1.0.0",
-  "description": "零依赖单文件 Node CLI · 结构复杂度（圈复杂度 + 函数长度）静态扫描器，开箱进 CI",
+  "version": "1.1.0",
+  "description": "零依赖单文件 Node CLI · 结构复杂度（圈复杂度 + 函数长度）静态扫描器，门禁三态 + 开箱进 CI",
   "bin": {
     "cycscan": "index.js"
   },
   "main": "index.js",
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "test": "node test.js"
+    "test": "node test/unit.test.js && node test/smoke-cli.js",
+    "test:unit": "node test/unit.test.js",
+    "test:smoke": "node test/smoke-cli.js",
+    "dogfood": "node index.js --root . --json --max-issues 20"
   },
   "keywords": [
     "complexity",
@@ -16,8 +24,19 @@
     "code-health",
     "lint",
     "ci",
-    "zero-dependency"
+    "zero-dependency",
+    "code-complexity",
+    "long-function"
   ],
+  "author": "huanweide",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huanweide/cycscan.git"
+  },
+  "bugs": {
+    "url": "https://github.com/huanweide/cycscan/issues"
+  },
+  "homepage": "https://github.com/huanweide/cycscan#readme",
   "license": "MIT",
   "engines": {
     "node": ">=14"
