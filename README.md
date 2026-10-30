@@ -1,5 +1,7 @@
+English: 暂未提供
+
 > [!WARNING]
-> **⚠️ 本轴已并入 [doctors](https://github.com/huanweide/doctors) 家族 monorepo → 本仓停止维护。**
+> **⚠️ 本工具已并入 [doctors](https://github.com/huanweide/doctors) monorepo → 本仓停止维护。**
 >
 > 代码原件已迁至 [`doctors/packages/cycscan/`](https://github.com/huanweide/doctors/tree/main/packages/cycscan)，
 > 在 doctors 里以 `doctors cyc` 子命令调用（或 `node packages/cycscan/index.js`）。
@@ -8,10 +10,10 @@
 <!-- badges -->
 [![License](https://img.shields.io/github/license/huanweide/cycscan)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/huanweide/cycscan)](https://github.com/huanweide/cycscan/stargazers)
-[![Engineering Health Family](https://img.shields.io/badge/Engineering%20Health%20Family-18%20axes-22c55e)](https://github.com/huanweide/family-showcase)
+[![zero-dep checkup CLI](https://img.shields.io/badge/zero--dep%20checkup%20CLI-18%20tools-22c55e)](https://github.com/huanweide/family-showcase)
 <!-- /badges -->
 
-**🔧 Part of the [Engineering Health Family](https://github.com/huanweide/family-showcase)** (18 zero-dependency checkup axes). Standalone tool — see [doctors](https://github.com/huanweide/doctors) (monorepo) and [enghealth](https://github.com/huanweide/enghealth) (unified runner).
+**🔧 本工具属于 [huanweide 零依赖 CLI 系列](https://github.com/huanweide/family-showcase)（共 18 件单文件工具）。可单独使用，也可在 [doctors](https://github.com/huanweide/doctors) monorepo 中以子命令调用，或用 [enghealth](https://github.com/huanweide/enghealth) 统一运行。**
 
 # cycscan
 
@@ -141,7 +143,7 @@ cycscan · 结构复杂度扫描 · root=/project/src
 
 ## 与同家族工具
 
-cycscan 是「代码健康 family」第六轴（结构复杂度），与以下零依赖单文件工具互补：
+cycscan 是 huanweide 零依赖 CLI 系列中负责「结构复杂度」的一件，与以下同范式工具互补：
 
 - `devdoctor` —— 依赖体检（胖瘦 / 许可证 / 循环依赖 / 密钥）
 - `testlite` —— 测试卫生体检
@@ -179,7 +181,7 @@ MIT
 
 ## 作者
 
-由 **ReTr · huanweide** 维护 · [GitHub 主页](https://github.com/huanweide)
+由 **huanweide** 维护 · [GitHub 主页](https://github.com/huanweide)
 
 
 ## 许可证
@@ -194,4 +196,4 @@ MIT，详见 [LICENSE](LICENSE)。
 - 离线 / 跨平台：Node 18+ 即可，不联网、不挑系统。
 - 一键跑：`node index.js --root ./src`（详见上方用法）。
 
-← [回到代码健康家族总览](https://github.com/huanweide/family-showcase)
+← [回到零依赖 CLI 系列总览](https://github.com/huanweide/family-showcase)
