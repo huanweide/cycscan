@@ -1,4 +1,4 @@
-English: 暂未提供
+**English** · [README_EN.md](./README_EN.md)
 
 > [!WARNING]
 > **⚠️ 本工具已并入 [doctors](https://github.com/huanweide/doctors) monorepo → 本仓停止维护。**
